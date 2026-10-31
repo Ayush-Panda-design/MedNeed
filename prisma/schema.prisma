@@ -1,0 +1,319 @@
+// Prisma schema for MedNeed Pharmacy & Diagnostics (Supabase PostgreSQL)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum DrugSchedule {
+  OTC
+  SCHEDULE_H
+  SCHEDULE_H1
+  SCHEDULE_X
+}
+
+enum DosageForm {
+  TABLET
+  CAPSULE
+  SYRUP
+  INJECTION
+  GEL
+  DROPS
+  INHALER
+  SACHET
+}
+
+enum OrderStatus {
+  PLACED
+  RX_VERIFICATION
+  PACKED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  RAZORPAY_UPI
+  RAZORPAY_CARD
+  COD
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  REFUNDED
+  FAILED
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  STORE_MANAGER
+  PHARMACIST
+  AUDIT_OFFICER
+  CUSTOMER
+}
+
+enum FranchiseStatus {
+  NEW
+  CONTACTED
+  SITE_VISIT
+  APPROVED
+  REJECTED
+}
+
+// 1. Medicine Master (Modeled after Apollo Pharmacy / Tata 1mg)
+model Medicine {
+  id                  String         @id @default(uuid())
+  localWellCode       String         @unique // Barcode/SKU mapping to LocalWell ERP
+  name                String         // Brand name e.g. "Dolo 650mg Tablet"
+  brand               String         // Manufacturer e.g. "Micro Labs Ltd"
+  category            String         // Therapeutic category e.g. "Pain Relief", "Diabetes"
+  dosageForm          DosageForm     @default(TABLET)
+  packaging           String         // e.g. "Strip of 15 Tablets"
+  schedule            DrugSchedule   @default(OTC)
+  requiresPrescription Boolean       @default(false)
+  isColdChain         Boolean        @default(false)
+  description         String?        @db.Text
+  storageInstructions String?        // e.g. "Store below 25°C, protect from moisture"
+  hsnCode             String?        @default("3004")
+  gstRate             Decimal        @default(12.0) @db.Decimal(5, 2)
+  
+  // Generic Salt mapping (Many-to-Many / Composition)
+  saltComposition     String         // e.g. "Paracetamol (650mg)"
+
+  // Dynamic pricing fields
+  baseMrp             Decimal        @db.Decimal(10, 2) // Current Catalog MRP
+  discountPercentage  Decimal        @default(0.0) @db.Decimal(5, 2)
+  sellingPrice        Decimal        @db.Decimal(10, 2)
+
+  // Traceability & Data Source tracking
+  sourceName          String?        @default("Indian-Pharma-Catalogue")
+  sourceId            String?
+  lastPriceVerifiedAt DateTime?      @default(now())
+
+  // Relationships
+  batches             MedicineBatch[]
+  orderItems          OrderItem[]
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  @@index([category])
+  @@index([saltComposition])
+}
+
+// 2. Physical Batches & FEFO Inventory (Direct from LocalWell ERP)
+model MedicineBatch {
+  id              String       @id @default(uuid())
+  medicineId      String
+  medicine        Medicine     @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+  batchNumber     String       // e.g. "ML-2024-B1" (printed on strip)
+  printedMrp      Decimal      @db.Decimal(10, 2) // Legal statutory MRP for this specific batch
+  purchaseRate    Decimal      @db.Decimal(10, 2) // Cost rate from distributor
+  quantity        Int          // Available units in stock
+  expiryDate      DateTime     // Expiry date (FEFO sort)
+  isQuarantined   Boolean      @default(false) // Blocked if expired or damaged
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@unique([medicineId, batchNumber])
+  @@index([expiryDate])
+}
+
+// 3. Diagnostic Blood Tests & Packages
+model DiagnosticTest {
+  id               String      @id @default(uuid())
+  name             String      // e.g. "Comprehensive Full Body Health Checkup"
+  category         String      // "Full Body", "Diabetes", "Thyroid"
+  mrp              Decimal     @db.Decimal(10, 2)
+  discountedPrice  Decimal     @db.Decimal(10, 2)
+  fastingHours     Int         @default(0) // e.g. 10 hours
+  sampleType       String      @default("Blood") // Blood, Urine
+  turnaroundHours  Int         @default(12) // Report ETA in hours
+  testCount        Int         @default(1)
+  parameters       String[]    // Included test list
+  popular          Boolean     @default(false)
+  createdAt        DateTime    @default(now())
+}
+
+// 4. Orders
+model Order {
+  id                 String           @id // E.g. "ORD-8921"
+  userId             String           @default("usr-system") // Supabase auth.users(id)
+  customerName       String
+  customerPhone      String
+  customerEmail      String?
+  address            String           @db.Text
+  pincode            String           // 6-digit PIN within 5-10km
+  distanceKm         Decimal          @db.Decimal(4, 1) // e.g. 3.8
+  
+  // Financials
+  subtotal           Decimal          @db.Decimal(10, 2)
+  discountTotal      Decimal          @db.Decimal(10, 2)
+  deliveryFee        Decimal          @default(0.0) @db.Decimal(10, 2)
+  finalTotal         Decimal          @db.Decimal(10, 2)
+  
+  // Payment
+  paymentMethod      PaymentMethod    @default(RAZORPAY_UPI)
+  paymentStatus      PaymentStatus    @default(PENDING)
+  razorpayOrderId    String?
+  razorpayPaymentId  String?
+  razorpaySignature  String?
+
+  // Delivery & Handover OTP
+  orderStatus        OrderStatus      @default(PLACED)
+  deliveryOtp        String           // 4-digit code required for handover
+  riderName          String?
+  riderPhone         String?
+  estimatedMinutes   Int?             @default(30)
+  
+  // Prescription verification
+  prescriptionUrl    String?          @db.Text // Stored in Supabase Storage Bucket
+  prescriptionStatus String?          @default("NOT_REQUIRED") // NOT_REQUIRED, PENDING_REVIEW, VERIFIED, REJECTED
+  rejectionReason    String?
+
+  // Doctor teleconsultation
+  doctorConsultRequired Boolean          @default(false)
+  doctorConsultStatus   String?          @default("NOT_REQUIRED") // NOT_REQUIRED, PENDING_CALL, COMPLETED
+
+  // Diagnostic patient details & appointment
+  diagnosticPatientName     String?
+  diagnosticPatientAge      Int?
+  diagnosticPatientGender   String?
+  diagnosticPatientRelation String?
+  diagnosticCollectionDate  String?
+  diagnosticCollectionSlot  String?
+
+  // Items
+  items              OrderItem[]
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  @@index([userId])
+  @@index([orderStatus])
+  @@index([customerPhone])
+}
+
+model OrderItem {
+  id              String      @id @default(uuid())
+  orderId         String
+  order           Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  medicineId      String?
+  medicine        Medicine?   @relation(fields: [medicineId], references: [id])
+  title           String
+  itemType        String      // "MEDICINE" or "DIAGNOSTIC_TEST"
+  batchNumber     String?     // Attached physical batch
+  mrp             Decimal     @db.Decimal(10, 2)
+  unitPrice       Decimal     @db.Decimal(10, 2)
+  quantity        Int
+}
+
+// 5. Dynamic Bulk Discount Rules
+model DiscountRule {
+  id                 String     @id @default(uuid())
+  title              String     // e.g. "Storewide Flat 5% OFF"
+  scope              String     // "ALL_MEDICINES" or "CATEGORY"
+  targetCategory     String?    // e.g. "Diabetes"
+  discountPercentage Decimal    @db.Decimal(5, 2) // e.g. 5.00, 10.00
+  isActive           Boolean    @default(true)
+  updatedBy          String
+  updatedAt          DateTime   @updatedAt
+  createdAt          DateTime   @default(now())
+}
+
+// 6. Franchise Applications & CRM Pipeline
+model FranchiseInquiry {
+  id                   String           @id // E.g. "FRAN-101"
+  fullName             String
+  phone                String
+  email                String
+  city                 String
+  proposedArea         String
+  commercialSpaceSqFt  Int
+  ownershipType        String           // "OWNED" or "RENTED"
+  investmentBudget     String           // "5_TO_10_LAKHS", "10_TO_20_LAKHS", "20_LAKHS_PLUS"
+  hasPharmaExperience  Boolean          @default(false)
+  status               FranchiseStatus  @default(NEW)
+  notes                String?          @db.Text
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+}
+
+// 7. Immutable Regulatory Audit Trail
+model AuditLog {
+  id         String     @id @default(uuid())
+  timestamp  DateTime   @default(now())
+  actorName  String     // e.g. "Rajesh Sharma"
+  actorRole  AdminRole  // SUPER_ADMIN, PHARMACIST, etc.
+  actionType String     // BULK_DISCOUNT_APPLIED, PRESCRIPTION_VERIFIED, etc.
+  details    String     @db.Text
+  oldValue   String?    @db.Text
+  newValue   String?    @db.Text
+  ipAddress  String?
+  
+  @@index([timestamp])
+  @@index([actionType])
+}
+
+// 8. Admin & Staff Users
+model AdminUser {
+  id                      String     @id @default(uuid())
+  email                   String     @unique
+  name                    String
+  role                    AdminRole  @default(STORE_MANAGER)
+  passwordHash            String?
+  provider                String     @default("email") // "email" or "google"
+  pharmacistLicenseNumber String?
+  pharmacistRegNo         String?
+  isActive                Boolean    @default(true)
+  avatar                  String?
+  createdAt               DateTime   @default(now())
+}
+
+// 9. Customer / Patient Users
+model CustomerUser {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  name         String
+  phone        String?
+  passwordHash String?
+  provider     String     @default("email") // "email" or "google"
+  avatar       String?
+  createdAt    DateTime   @default(now())
+}
+
+// 10. Persistent Server Cart Items (Cross-Device Sync with Supabase RLS)
+model CartItem {
+  id         String   @id @default(uuid())
+  userId     String   // Supabase auth.users(id)
+  itemId     String   // Medicine ID or DiagnosticTest ID
+  itemType   String   // "MEDICINE" or "DIAGNOSTIC_TEST"
+  quantity   Int      @default(1)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([userId, itemId])
+  @@index([userId])
+}
+
+// 11. Customer Saved Delivery Addresses (Supabase RLS)
+model Address {
+  id            String   @id @default(uuid())
+  userId        String   // Supabase auth.users(id)
+  fullName      String
+  phone         String
+  streetAddress String
+  landmark      String?
+  city          String   @default("Bhubaneswar")
+  state         String   @default("Odisha")
+  pincode       String
+  isDefault     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([userId])
+}
